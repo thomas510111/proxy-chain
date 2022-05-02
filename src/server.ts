@@ -1,4 +1,5 @@
 import net from 'net';
+import dns from 'dns';
 import http from 'http';
 import util from 'util';
 import { URL } from 'url';
@@ -14,6 +15,7 @@ import { forward, HandlerOpts as ForwardOpts } from './forward';
 import { direct } from './direct';
 import { handleCustomResponse, HandlerOpts as CustomResponseOpts } from './custom_response';
 import { Socket } from './socket';
+import { normalizeUrlPort } from './utils/normalize_url_port';
 
 // TODO:
 // - Implement this requirement from rfc7230
@@ -45,15 +47,16 @@ type HandlerOpts = {
     isHttp: boolean;
     customResponseFunction: CustomResponseOpts['customResponseFunction'] | null;
     localAddress?: string;
+    dnsLookup?: typeof dns['lookup'];
 };
 
 export type PrepareRequestFunctionOpts = {
-    connectionId: unknown;
+    connectionId: number;
     request: http.IncomingMessage;
     username: string;
     password: string;
     hostname: string;
-    port: string;
+    port: number;
     isHttp: boolean;
 };
 
@@ -63,6 +66,7 @@ export type PrepareRequestFunctionResult = {
     failMsg?: string;
     upstreamProxyUrl?: string | null;
     localAddress?: string;
+    dnsLookup?: typeof dns['lookup'];
 };
 
 type Promisable<T> = T | Promise<T>;
@@ -88,7 +92,7 @@ export class Server extends EventEmitter {
 
     stats: { httpRequestCount: number; connectRequestCount: number; };
 
-    connections: Map<unknown, Socket>;
+    connections: Map<number, Socket>;
 
     /**
      * Initializes a new instance of Server class.
@@ -180,8 +184,7 @@ export class Server extends EventEmitter {
      * Needed for abrupt close of the server.
      */
     registerConnection(socket: Socket): void {
-        const weakId = Math.random().toString(36).slice(2);
-        const unique = Symbol(weakId);
+        const unique = this.lastHandlerId++;
 
         socket.proxyChainId = unique;
         this.connections.set(unique, socket);
@@ -200,6 +203,12 @@ export class Server extends EventEmitter {
      * Handles incoming sockets, useful for error handling
      */
     onConnection(socket: Socket): void {
+        // https://github.com/nodejs/node/issues/23858
+        if (!socket.remoteAddress) {
+            socket.destroy();
+            return;
+        }
+
         this.registerConnection(socket);
 
         // We need to consume socket errors, because the handlers are attached asynchronously.
@@ -289,7 +298,7 @@ export class Server extends EventEmitter {
     getHandlerOpts(request: http.IncomingMessage): HandlerOpts {
         const handlerOpts: HandlerOpts = {
             server: this,
-            id: ++this.lastHandlerId,
+            id: (request.socket as Socket).proxyChainId!,
             srcRequest: request,
             srcHead: null,
             trgParsed: null,
@@ -349,12 +358,12 @@ export class Server extends EventEmitter {
         // Authenticate the request using a user function (if provided)
         if (this.prepareRequestFunction) {
             const funcOpts: PrepareRequestFunctionOpts = {
-                connectionId: (request.socket as Socket).proxyChainId,
+                connectionId: (request.socket as Socket).proxyChainId!,
                 request,
                 username: '',
                 password: '',
                 hostname: handlerOpts.trgParsed!.hostname,
-                port: handlerOpts.trgParsed!.port,
+                port: normalizeUrlPort(handlerOpts.trgParsed!),
                 isHttp: handlerOpts.isHttp,
             };
 
@@ -391,6 +400,7 @@ export class Server extends EventEmitter {
         const funcResult = await this.callPrepareRequestFunction(request, handlerOpts);
 
         handlerOpts.localAddress = funcResult.localAddress;
+        handlerOpts.dnsLookup = funcResult.dnsLookup;
 
         // If not authenticated, request client to authenticate
         if (funcResult.requestAuthentication) {
@@ -541,14 +551,14 @@ export class Server extends EventEmitter {
     /**
      * Gets array of IDs of all active connections.
      */
-    getConnectionIds(): unknown[] {
+    getConnectionIds(): number[] {
         return [...this.connections.keys()];
     }
 
     /**
      * Gets data transfer statistics of a specific proxy connection.
      */
-    getConnectionStats(connectionId: unknown): ConnectionStats | undefined {
+    getConnectionStats(connectionId: number): ConnectionStats | undefined {
         const socket = this.connections.get(connectionId);
         if (!socket) return undefined;
 
@@ -562,6 +572,20 @@ export class Server extends EventEmitter {
         };
 
         return result;
+    }
+
+    /**
+     * Forcibly close a specific pending proxy connection.
+     */
+    closeConnection(connectionId: number): void {
+        this.log(null, 'Closing pending socket');
+
+        const socket = this.connections.get(connectionId);
+        if (!socket) return;
+
+        socket.destroy();
+
+        this.log(null, `Destroyed pending socket`);
     }
 
     /**
